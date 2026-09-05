@@ -1,0 +1,20 @@
+[package]
+name = "dns_tunnel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = { version = "0.36.1", features = ["persistence"] }
+ferrisetw = "1.2.0"
+psl = "2.1.226"
+ron = "0.12"
+serde = { version = "1", features = ["derive"] }
+
+# Lints apply to the whole crate (lib + bin + tests).
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
