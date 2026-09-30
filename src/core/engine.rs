@@ -28,8 +28,13 @@ use crate::core::router::windows::{WindowsRouter, discover_peer, discover_tunnel
 use crate::core::router::{RouteRegistry, registry_path};
 use crate::core::settings::Settings;
 
-/// How long a route lives before the cleanup cycle removes it.
-pub const ROUTE_TTL: Duration = Duration::from_mins(15);
+/// How often the cleanup loop runs: expire dead routes and re-pin
+/// near-expiry domains. Independent of any TTL — the loop is a heartbeat.
+pub(crate) const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How far ahead of expiry a redirect-list domain is re-queried so its
+/// routes stay pinned without waiting for a client to ask again.
+pub(crate) const REPIN_LEAD: Duration = Duration::from_secs(30);
 
 /// Socket poll interval — how often the receive loops check the shutdown
 /// flag.
@@ -88,6 +93,9 @@ pub(crate) enum Command {
     SetRedirectList(Vec<String>),
     /// Replace the static CIDR list (applied on save while running).
     SetCidrList(Vec<String>),
+    /// Re-query these domains so their routes stay pinned before the DNS
+    /// TTL elapses. Emitted by the cleanup loop; handled by the listener.
+    RepinDomains(Vec<String>),
 }
 
 /// Handle to a running engine.
@@ -246,6 +254,7 @@ impl Engine {
             cidrs,
             tracker,
             ports,
+            commands: command_tx.clone(),
         };
         let threads = spawn_threads(&runtime, command_rx)?;
 
@@ -282,6 +291,9 @@ struct Runtime {
     cidrs: BTreeSet<Cidr>,
     tracker: Option<Arc<ProcessTracker>>,
     ports: Arc<PortOwners>,
+    /// Sender side of the command channel — cloned into the cleanup loop
+    /// so it can request re-pins without going through the UI.
+    commands: mpsc::Sender<Command>,
 }
 
 /// Spawns the three engine threads and returns their join handles.
@@ -347,6 +359,7 @@ fn spawn_threads(
                 let registry = Arc::clone(&runtime.registry);
                 let registry_path = runtime.registry_path.clone();
                 let events = runtime.events.clone();
+                let commands = runtime.commands.clone();
                 let shutdown = Arc::clone(&runtime.shutdown);
                 let vpn_interface = runtime.vpn_interface.clone();
                 let vpn_gateway = runtime.vpn_gateway.clone();
@@ -356,6 +369,7 @@ fn spawn_threads(
                         registry,
                         registry_path,
                         events,
+                        commands,
                         shutdown,
                         vpn_interface,
                         vpn_gateway,
@@ -413,8 +427,8 @@ fn resolve_next_hop(vpn_interface: &str, vpn_gateway: &str) -> io::Result<Ipv4Ad
     }
 }
 
-/// The 15-minute cleanup cycle: removes routes that lived past [`ROUTE_TTL`]
-/// and re-discovers the tunnel peer after VPN reconnects.
+/// The cleanup cycle: expires dead routes, re-pins domains whose routes
+/// are near expiry, and re-discovers the tunnel peer after VPN reconnects.
 ///
 /// Thread entry point: takes ownership because the caller hands the values
 /// to a new thread.
@@ -423,12 +437,13 @@ fn cleanup_loop(
     registry: Arc<Mutex<RouteRegistry>>,
     registry_path: PathBuf,
     events: mpsc::Sender<Event>,
+    commands: mpsc::Sender<Command>,
     shutdown: Arc<AtomicBool>,
     vpn_interface: String,
     vpn_gateway: String,
     cidrs: BTreeSet<Cidr>,
 ) {
-    let mut next = Instant::now() + ROUTE_TTL;
+    let mut next = Instant::now() + CLEANUP_INTERVAL;
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return;
@@ -470,19 +485,29 @@ fn cleanup_loop(
                 }
                 Ok(_) => {}
             }
-            let (removed, errors) = registry.expire(now, ROUTE_TTL);
+            // Routes whose own DNS TTL has elapsed.
+            let (removed, errors) = registry.expire(now);
             for ip in removed {
                 let _ = events.send(Event::RouteRemoved { ip });
             }
             for error in errors {
                 let _ = events.send(Event::Error(error));
             }
+            // Domains whose routes are near expiry. Collected under the
+            // lock, dispatched after — the listener's command handler
+            // re-locks the redirect list, and holding the registry lock
+            // while it does so risks cross-lock contention.
+            let expiring = registry.expiring_domains(REPIN_LEAD, now);
             if let Err(e) = registry.save(&registry_path) {
                 let _ = events.send(Event::Error(format!(
                     "failed to persist route registry: {e}"
                 )));
             }
-            next = now + ROUTE_TTL;
+            drop(registry);
+            if !expiring.is_empty() {
+                let _ = commands.send(Command::RepinDomains(expiring));
+            }
+            next = now + CLEANUP_INTERVAL;
             continue;
         }
         thread::park_timeout(next.saturating_duration_since(now));

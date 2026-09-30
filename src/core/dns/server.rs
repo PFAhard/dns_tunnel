@@ -27,6 +27,10 @@ pub(crate) struct Pending {
     pub orig_id: u16,
     /// Whether the queried domain matched the redirect list.
     pub needs_routing: bool,
+    /// The queried domain. Used to attribute routes for
+    /// [`crate::core::router::RouteRegistry::register`] and to schedule
+    /// re-pins near expiry.
+    pub domain: String,
     /// When to give up on the upstream response.
     pub deadline: Instant,
 }
@@ -149,6 +153,21 @@ pub(crate) fn run(listener: Arc<UdpSocket>, ctx: ListenerCtx) {
                         let _ = ctx.events.send(Event::Error(error));
                     }
                 }
+                Command::RepinDomains(domains) => {
+                    // Domains the cleanup loop asked us to refresh. Filter
+                    // against the current redirect list first — a domain
+                    // removed by the user while its routes were pinned must
+                    // not be re-queried back into existence.
+                    let redirect = read_ok(&ctx.redirect);
+                    let still_listed: Vec<String> = domains
+                        .into_iter()
+                        .filter(|domain| redirect.matches(domain))
+                        .collect();
+                    drop(redirect);
+                    if !still_listed.is_empty() {
+                        pin_domains(still_listed, &ctx, &mut last_send);
+                    }
+                }
             }
         }
         match listener.recv_from(&mut buf) {
@@ -209,6 +228,7 @@ fn handle_query(
             client: Some(client),
             orig_id: header.id,
             needs_routing: read_ok(&ctx.redirect).matches(&question.name),
+            domain: question.name.clone(),
             deadline,
         },
     );
@@ -278,6 +298,7 @@ fn pin_domains(domains: Vec<String>, ctx: &ListenerCtx, last_send: &mut Instant)
                 client: None,
                 orig_id: id,
                 needs_routing: true,
+                domain: domain.clone(),
                 deadline: Instant::now() + ctx.timeout,
             },
         );

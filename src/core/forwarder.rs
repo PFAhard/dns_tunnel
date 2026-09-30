@@ -5,7 +5,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::core::dns::message::{collect_a_records, parse_questions};
 use crate::core::dns::server::PendingMap;
@@ -128,8 +128,10 @@ fn handle_response(
         && let Ok(addresses) = collect_a_records(bytes, &header, cursor)
     {
         let mut registry = lock_ok(registry);
-        for ip in addresses {
-            match registry.register(ip, Instant::now()) {
+        let now = Instant::now();
+        for (ip, ttl_secs) in addresses {
+            let ttl = Duration::from_secs(u64::from(ttl_secs));
+            match registry.register(ip, ttl, &entry.domain, now) {
                 Ok(true) => {
                     let _ = events.send(Event::RouteAdded { ip });
                 }

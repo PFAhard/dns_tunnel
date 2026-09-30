@@ -47,7 +47,7 @@ fn main() {
                     match collect_a_records(bytes, &header, cursor) {
                         Ok(addresses) => {
                             for ip in &addresses {
-                                println!("  A {ip}");
+                                println!("  A {:?}", ip);
                             }
                             if addresses.is_empty() {
                                 println!("  (no A records)");

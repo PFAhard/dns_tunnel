@@ -45,6 +45,28 @@ pub trait RouteOps: Send + Sync {
     fn delete_net_route(&self, cidr: Cidr, gateway: Ipv4Addr) -> io::Result<()>;
 }
 
+/// Floor for a route's lifetime: a DNS TTL below this is still pinned for
+/// at least this long, so a client hammering a short-TTL name does not
+/// cause add/remove churn.
+pub(crate) const MIN_ROUTE_TTL: Duration = Duration::from_secs(30);
+
+/// Ceiling for a route's lifetime: a DNS answer with an unusually large
+/// TTL is not pinned indefinitely. The cleanup loop re-queries near
+/// expiry anyway, so this only matters if the cleanup loop stops running.
+pub(crate) const MAX_ROUTE_TTL: Duration = Duration::from_secs(3600);
+
+/// A registered host route.
+#[derive(Debug, Clone)]
+struct Entry {
+    /// When this route should be removed unless refreshed.
+    expires_at: Instant,
+    /// The redirect-list domain whose A records produced this route.
+    /// Used by [`RouteRegistry::expiring_domains`] to schedule re-pins.
+    /// Empty for entries loaded from disk (crash cleanup deletes those
+    /// before the engine starts).
+    domain: String,
+}
+
 /// Path of the persisted registry: `%APPDATA%\dns_tunnel\routes.ron`.
 #[must_use]
 pub fn registry_path() -> Option<PathBuf> {
@@ -81,7 +103,7 @@ struct RegistryFile {
 /// The set of host routes currently pinned to the VPN tunnel.
 pub struct RouteRegistry {
     next_hop: Ipv4Addr,
-    entries: BTreeMap<Ipv4Addr, Instant>,
+    entries: BTreeMap<Ipv4Addr, Entry>,
     nets: BTreeSet<Cidr>,
     ops: Box<dyn RouteOps>,
 }
@@ -130,8 +152,16 @@ impl RouteRegistry {
             let ip: Ipv4Addr = route.parse().map_err(|_| {
                 io::Error::other(format!("corrupt route entry in `{}`", path.display()))
             })?;
-            // Age is irrelevant: leftovers are deleted on load.
-            entries.insert(ip, Instant::now());
+            // Loaded entries are immediately expired (crash cleanup deletes
+            // them before the engine starts), and have no domain
+            // attribution — both only matter while the engine runs.
+            entries.insert(
+                ip,
+                Entry {
+                    expires_at: Instant::now(),
+                    domain: String::new(),
+                },
+            );
         }
         let mut nets = BTreeSet::new();
         for net in parsed.nets {
@@ -186,10 +216,12 @@ impl RouteRegistry {
         self.next_hop = next_hop;
     }
 
-    /// Registers a host route for `ip`.
+    /// Registers a host route for `ip`, valid for `ttl` (from the DNS
+    /// answer, clamped to `[MIN_ROUTE_TTL, MAX_ROUTE_TTL]`).
     ///
-    /// If the IP is already routed, only its timestamp is refreshed.
-    /// Returns `Ok(true)` when a new OS route was added.
+    /// If the IP is already routed, its expiry and domain attribution are
+    /// refreshed (last observed wins). Returns `Ok(true)` when a new OS
+    /// route was added.
     ///
     /// Non-routable addresses ([`is_routable`]) are silently skipped and
     /// reported as `Ok(false)` — resolvers return `0.0.0.0` for blocked
@@ -201,29 +233,43 @@ impl RouteRegistry {
     /// Returns an error if the OS refuses the route (e.g. unreachable
     /// next hop). Persistence is best-effort — a failed save is ignored;
     /// reboot-clearance and manual cleanup remain as safety nets.
-    pub fn register(&mut self, ip: Ipv4Addr, now: Instant) -> io::Result<bool> {
+    pub fn register(
+        &mut self,
+        ip: Ipv4Addr,
+        ttl: Duration,
+        domain: &str,
+        now: Instant,
+    ) -> io::Result<bool> {
         if !is_routable(ip) {
             return Ok(false);
         }
-        if let Some(added) = self.entries.get_mut(&ip) {
-            *added = now;
+        let expires_at = now + ttl.clamp(MIN_ROUTE_TTL, MAX_ROUTE_TTL);
+        if let Some(entry) = self.entries.get_mut(&ip) {
+            entry.expires_at = expires_at;
+            entry.domain = domain.to_owned();
             return Ok(false);
         }
         self.ops.add_route(ip, self.next_hop)?;
-        self.entries.insert(ip, now);
+        self.entries.insert(
+            ip,
+            Entry {
+                expires_at,
+                domain: domain.to_owned(),
+            },
+        );
         Ok(true)
     }
 
-    /// Removes entries at least `ttl` old.
+    /// Removes entries whose own expiry has passed.
     ///
     /// Returns the removed IPs and error messages for deletions that failed
     /// (those entries are kept and retried on the next cycle).
     #[must_use]
-    pub fn expire(&mut self, now: Instant, ttl: Duration) -> (Vec<Ipv4Addr>, Vec<String>) {
+    pub fn expire(&mut self, now: Instant) -> (Vec<Ipv4Addr>, Vec<String>) {
         let mut removed = Vec::new();
         let mut errors = Vec::new();
-        self.entries.retain(|ip, added| {
-            if now.duration_since(*added) < ttl {
+        self.entries.retain(|ip, entry| {
+            if entry.expires_at > now {
                 return true;
             }
             match self.ops.delete_route(*ip, self.next_hop) {
@@ -238,6 +284,23 @@ impl RouteRegistry {
             }
         });
         (removed, errors)
+    }
+
+    /// Returns the distinct domains whose routes expire within `within`
+    /// of `now` — the ones worth re-querying so their routes stay pinned.
+    /// Entries loaded from disk have no domain and are skipped.
+    #[must_use]
+    pub fn expiring_domains(&self, within: Duration, now: Instant) -> Vec<String> {
+        let mut seen = BTreeSet::new();
+        for entry in self.entries.values() {
+            if entry.domain.is_empty() {
+                continue;
+            }
+            if entry.expires_at.saturating_duration_since(now) <= within {
+                seen.insert(entry.domain.clone());
+            }
+        }
+        seen.into_iter().collect()
     }
 
     /// Deletes every registered route, including the static networks.
@@ -393,7 +456,9 @@ mod tests {
             Ipv4Addr::new(255, 255, 255, 255),
         ] {
             assert!(
-                !registry.register(ip, now).unwrap(),
+                !registry
+                    .register(ip, Duration::from_secs(300), "example.com", now)
+                    .unwrap(),
                 "{ip} should not be routed"
             );
         }
@@ -416,7 +481,9 @@ mod tests {
             Ipv4Addr::new(1, 1, 1, 1),
         ] {
             assert!(
-                registry.register(ip, now).unwrap(),
+                registry
+                    .register(ip, Duration::from_secs(300), "example.com", now)
+                    .unwrap(),
                 "{ip} should be routed"
             );
         }
@@ -427,10 +494,19 @@ mod tests {
         let ops = FakeOps::new();
         let mut registry = RouteRegistry::new(gateway(), Box::new(ops.clone()));
         let now = Instant::now();
-        assert!(registry.register(ip(4), now).unwrap());
+        assert!(
+            registry
+                .register(ip(4), Duration::from_secs(300), "example.com", now)
+                .unwrap()
+        );
         assert!(
             !registry
-                .register(ip(4), now + Duration::from_mins(1))
+                .register(
+                    ip(4),
+                    Duration::from_secs(300),
+                    "example.com",
+                    now + Duration::from_mins(1)
+                )
                 .unwrap()
         );
         assert_eq!(ops.added(), vec![ip(4)]);
@@ -443,7 +519,9 @@ mod tests {
         let ops = FakeOps::new();
         {
             let mut registry = RouteRegistry::new(gateway(), Box::new(ops.clone()));
-            registry.register(ip(5), Instant::now()).unwrap();
+            registry
+                .register(ip(5), Duration::from_secs(300), "example.com", Instant::now())
+                .unwrap();
             registry.save(&path).unwrap();
         }
         let (loaded, existed) = RouteRegistry::load(&path, Box::new(ops), gateway()).unwrap();
@@ -475,17 +553,92 @@ mod tests {
         let ops = FakeOps::new();
         let mut registry = RouteRegistry::new(gateway(), Box::new(ops.clone()));
         let now = Instant::now();
+        // Registered long ago with a short TTL → already expired.
         registry
-            .register(ip(1), now.checked_sub(Duration::from_secs(2_000)).unwrap())
+            .register(
+                ip(1),
+                Duration::from_secs(60),
+                "a.example",
+                now.checked_sub(Duration::from_secs(2_000)).unwrap(),
+            )
             .unwrap();
+        // Registered 30 s ago with a 300 s TTL → still fresh.
         registry
-            .register(ip(2), now.checked_sub(Duration::from_mins(1)).unwrap())
+            .register(
+                ip(2),
+                Duration::from_secs(300),
+                "b.example",
+                now.checked_sub(Duration::from_secs(30)).unwrap(),
+            )
             .unwrap();
-        let (removed, errors) = registry.expire(now, Duration::from_mins(15));
+        let (removed, errors) = registry.expire(now);
         assert_eq!(errors, Vec::<String>::new());
         assert_eq!(removed, vec![ip(1)]);
         assert_eq!(ops.deleted(), vec![ip(1)]);
         assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn register_clamps_ttl_to_bounds() {
+        let ops = FakeOps::new();
+        let mut registry = RouteRegistry::new(gateway(), Box::new(ops.clone()));
+        let now = Instant::now();
+        // TTL below the floor is lifted to MIN_ROUTE_TTL.
+        registry
+            .register(ip(1), Duration::from_secs(1), "a.example", now)
+            .unwrap();
+        assert!(
+            registry
+                .expire(now + MIN_ROUTE_TTL - Duration::from_secs(1))
+                .0
+                .is_empty()
+        );
+        // TTL above the ceiling is cut to MAX_ROUTE_TTL.
+        registry
+            .register(ip(2), Duration::from_secs(10_000_000), "b.example", now)
+            .unwrap();
+        assert!(
+            registry
+                .expire(now + MAX_ROUTE_TTL - Duration::from_secs(1))
+                .0
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn expiring_domains_returns_unique_near_expiry() {
+        let ops = FakeOps::new();
+        let mut registry = RouteRegistry::new(gateway(), Box::new(ops.clone()));
+        let now = Instant::now();
+        // Two IPs for the same domain, both near expiry: deduped to one.
+        registry
+            .register(ip(1), Duration::from_secs(40), "a.example", now)
+            .unwrap();
+        registry
+            .register(ip(2), Duration::from_secs(40), "a.example", now)
+            .unwrap();
+        // One far from expiry: not included.
+        registry
+            .register(ip(3), Duration::from_secs(3600), "b.example", now)
+            .unwrap();
+        let expiring = registry.expiring_domains(Duration::from_secs(30), now);
+        assert_eq!(expiring, vec!["a.example".to_owned()]);
+    }
+
+    #[test]
+    fn delete_all_removes_everything() {
+        let ops = FakeOps::new();
+        let mut registry = RouteRegistry::new(gateway(), Box::new(ops.clone()));
+        registry
+            .register(ip(1), Duration::from_secs(300), "a.example", Instant::now())
+            .unwrap();
+        registry
+            .register(ip(2), Duration::from_secs(300), "b.example", Instant::now())
+            .unwrap();
+        let (removed, errors) = registry.delete_all();
+        assert_eq!(errors, Vec::<String>::new());
+        assert_eq!(removed, vec![ip(1), ip(2)]);
+        assert!(registry.is_empty());
     }
 
     #[test]
@@ -518,15 +671,4 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn delete_all_removes_everything() {
-        let ops = FakeOps::new();
-        let mut registry = RouteRegistry::new(gateway(), Box::new(ops.clone()));
-        registry.register(ip(1), Instant::now()).unwrap();
-        registry.register(ip(2), Instant::now()).unwrap();
-        let (removed, errors) = registry.delete_all();
-        assert_eq!(errors, Vec::<String>::new());
-        assert_eq!(removed, vec![ip(1), ip(2)]);
-        assert!(registry.is_empty());
-    }
 }

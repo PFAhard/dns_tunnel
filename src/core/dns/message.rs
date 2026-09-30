@@ -168,7 +168,7 @@ pub fn parse_questions(bytes: &[u8]) -> Result<(Header, Vec<Question>, usize), E
 }
 
 /// Walks `header.ancount` resource records starting at `cursor` and returns
-/// the IPv4 addresses of all A records.
+/// the IPv4 address and TTL of every A record.
 ///
 /// Other record types (CNAME, AAAA, TXT, …) are skipped — CNAME chains
 /// resolve to A records in the same answer section, which this collects.
@@ -181,20 +181,23 @@ pub fn collect_a_records(
     bytes: &[u8],
     header: &Header,
     cursor: usize,
-) -> Result<Vec<Ipv4Addr>, Error> {
+) -> Result<Vec<(Ipv4Addr, u32)>, Error> {
     let mut pos = cursor;
     let mut addresses = Vec::new();
     for _ in 0..header.ancount {
         parse_name(bytes, &mut pos)?; // owner name — discarded
         let qtype = read_u16(bytes, &mut pos)?;
         let _class = read_u16(bytes, &mut pos)?;
-        let _ttl = read_u32(bytes, &mut pos)?;
+        let ttl = read_u32(bytes, &mut pos)?;
         let rdlen = usize::from(read_u16(bytes, &mut pos)?);
         let rdata = bytes.get(pos..pos + rdlen).ok_or(Error::Truncated)?;
         // An A record with rdlen != 4 is malformed — skip it (lenient; the
         // response bytes are forwarded verbatim regardless).
         if qtype == TYPE_A && rdlen == 4 {
-            addresses.push(Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]));
+            addresses.push((
+                Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]),
+                ttl,
+            ));
         }
         pos += rdlen;
     }
@@ -376,7 +379,7 @@ mod tests {
         ]);
         let (header, _, cursor) = parse_questions(&bytes).unwrap();
         let addresses = collect_a_records(&bytes, &header, cursor).unwrap();
-        assert_eq!(addresses, vec![Ipv4Addr::new(93, 184, 216, 34)]);
+        assert_eq!(addresses, vec![(Ipv4Addr::new(93, 184, 216, 34), 300)]);
     }
 
     #[test]
@@ -389,7 +392,7 @@ mod tests {
         ]);
         let (header, _, cursor) = parse_questions(&bytes).unwrap();
         let addresses = collect_a_records(&bytes, &header, cursor).unwrap();
-        assert_eq!(addresses, vec![Ipv4Addr::new(10, 0, 0, 1)]);
+        assert_eq!(addresses, vec![(Ipv4Addr::new(10, 0, 0, 1), 300)]);
     }
 
     #[test]
