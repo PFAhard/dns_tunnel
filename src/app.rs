@@ -7,6 +7,7 @@
 //! [`App::new`], written in [`eframe::App::save`] (on exit).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -151,6 +152,21 @@ impl TrayState {
 // UI thread. It must not be invoked from the tray thread — see the note
 // on `TrayState`.
 
+/// Returns the current UTC time as `(hour, minute, second)`.
+///
+/// Uses `SystemTime` (no unsafe, no extra crate). The value is UTC — the
+/// project forbids unsafe code, so `GetLocalTime` isn't an option and
+/// adding a local-time crate for a timestamp prefix isn't worth the
+/// dependency. If local time is wanted later, swap in `chrono::Local`
+/// and delete this.
+fn utc_hms() -> (u64, u64, u64) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    (secs / 3600 % 24, secs / 60 % 60, secs % 60)
+}
+
 /// A plain solid-colour 32×32 tray icon, so we don't need an asset file.
 fn default_tray_icon() -> tray_icon::Icon {
     let (w, h) = (32u32, 32u32);
@@ -201,6 +217,9 @@ pub struct App {
     /// Log-tab view: group everything by top-level domain instead of
     /// listing every domain.
     show_tlds_only: bool,
+    /// Log-tab search box — case-insensitive substring filter on domains.
+    /// In-memory only; reset on each launch.
+    domain_filter: String,
     /// When the next automatic engine-start retry is due (`None` when no
     /// retry is pending).
     start_retry_at: Option<Instant>,
@@ -214,6 +233,21 @@ pub struct App {
     /// launch knows to auto-start, even though `self.engine` is `None` by
     /// the time `save` runs.
     engine_running_at_exit: bool,
+    /// Wall-clock moment the engine last reported `Started`. `None`
+    /// whenever the engine is stopped; used for the status bar's uptime.
+    engine_started_at: Option<Instant>,
+    /// Total queries forwarded this session (survives engine restarts;
+    /// resets only when the app itself is relaunched).
+    queries_total: u64,
+    /// Currently pinned route count, tracked from `RouteAdded` /
+    /// `RouteRemoved` events.
+    routes_total: u64,
+    /// Current route next hop (from the last `Started` event), shown in
+    /// the status bar.
+    next_hop: Option<Ipv4Addr>,
+    /// Set when the user clicks Restart: the stop worker completes, then
+    /// `poll_stop` calls `start_engine` again.
+    restart_after_stop: bool,
 }
 
 impl App {
@@ -241,10 +275,16 @@ impl App {
             system_log: VecDeque::new(),
             seen: BTreeMap::new(),
             show_tlds_only: false,
+            domain_filter: String::new(),
             start_retry_at: None,
             last_start_error: None,
             tray,
             engine_running_at_exit: false,
+            engine_started_at: None,
+            queries_total: 0,
+            routes_total: 0,
+            next_hop: None,
+            restart_after_stop: false,
         };
         if engine_was_running {
             // The engine was running when the app last closed (without an
@@ -264,19 +304,35 @@ impl App {
             "Every unique domain resolved through the engine this session. \
              Add the ones you want routed through the VPN.",
         );
-        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Search:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.domain_filter)
+                    .hint_text("partial domain match")
+                    .desired_width(240.0),
+            );
+            if ui.small_button("Clear").clicked() {
+                self.domain_filter.clear();
+            }
+        });
         ui.checkbox(
             &mut self.show_tlds_only,
             "Group by registrable domain (company.tld)",
         );
         ui.separator();
 
+        let needle = self.domain_filter.trim().to_lowercase();
         let mut add: Option<String> = None;
         if self.show_tlds_only {
             // Aggregate every domain into its registrable part; processes
-            // are merged.
+            // are merged. The filter is applied to the *underlying* domain
+            // so `www.example.com` still shows under `example.com` when the
+            // user types `www`.
             let mut tlds: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
             for (domain, processes) in &self.seen {
+                if !needle.is_empty() && !domain.to_lowercase().contains(&needle) {
+                    continue;
+                }
                 let tld = registrable_domain(domain);
                 tlds.entry(tld.to_owned())
                     .or_default()
@@ -297,7 +353,13 @@ impl App {
                     }
                 });
         } else {
-            let mut domains: Vec<&String> = self.seen.keys().collect();
+            let mut domains: Vec<&String> = self
+                .seen
+                .keys()
+                .filter(|domain| {
+                    needle.is_empty() || domain.to_lowercase().contains(&needle)
+                })
+                .collect();
             domains.sort_by(|a, b| compare_tld_first(a, b));
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -404,15 +466,12 @@ impl App {
                 // Drop runs on a worker thread — see `stop_engine`.
                 self.stop_engine();
             }
-            ui.label(if running {
-                "running"
-            } else if starting {
-                "starting…"
-            } else if stopping {
-                "stopping…"
-            } else {
-                "stopped"
-            });
+            if ui
+                .add_enabled(running && !stopping, egui::Button::new("Restart"))
+                .clicked()
+            {
+                self.restart_engine();
+            }
 
             if ui.button("Hide to tray").clicked() {
                 ui.ctx()
@@ -424,9 +483,51 @@ impl App {
             ui.label("Engine will not start — fix the settings first (Settings tab).");
         }
 
+        // Status bar — one line, always visible, does not scroll away.
+        ui.horizontal(|ui| {
+            if running {
+                ui.colored_label(egui::Color32::from_rgb(0x30, 0xC0, 0x30), "● running");
+                if let Some(started) = self.engine_started_at {
+                    let secs = started.elapsed().as_secs();
+                    ui.label(format!(
+                        "up {:02}:{:02}:{:02}",
+                        secs / 3600,
+                        (secs / 60) % 60,
+                        secs % 60
+                    ));
+                }
+            } else if starting {
+                ui.colored_label(egui::Color32::from_rgb(0xC0, 0xC0, 0x30), "● starting…");
+            } else if stopping {
+                ui.colored_label(egui::Color32::from_rgb(0xC0, 0xC0, 0x30), "● stopping…");
+            } else {
+                ui.colored_label(egui::Color32::from_rgb(0xC0, 0x30, 0x30), "● stopped");
+            }
+            ui.separator();
+            ui.label(format!("queries {}", self.queries_total));
+            ui.separator();
+            ui.label(format!("routes {}", self.routes_total));
+            if let Some(peer) = self.next_hop {
+                ui.separator();
+                ui.label(format!("via {peer}"));
+            }
+        });
+
         ui.separator();
         ui.columns(2, |columns| {
-            columns[0].label("DNS queries");
+            columns[0].push_id("query_header", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("DNS queries");
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.small_button("Clear").clicked() {
+                                self.query_log.clear();
+                            }
+                        },
+                    );
+                });
+            });
             columns[0].separator();
             // Distinct id scope per column: without this, both ScrollAreas
             // derive the same widget id from identical structure and end
@@ -443,7 +544,19 @@ impl App {
                     });
             });
 
-            columns[1].label("System");
+            columns[1].push_id("system_header", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("System");
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.small_button("Clear").clicked() {
+                                self.system_log.clear();
+                            }
+                        },
+                    );
+                });
+            });
             columns[1].separator();
             columns[1].push_id("tunnel_system_log", |ui| {
                 egui::ScrollArea::vertical()
@@ -584,8 +697,21 @@ impl App {
                 // still drain through `poll_events` because the channel
                 // stays open until the handle's sender is dropped.
                 self.stopping = None;
+                if self.restart_after_stop {
+                    self.restart_after_stop = false;
+                    self.start_engine();
+                }
             }
             Err(mpsc::TryRecvError::Empty) => {} // still stopping
+        }
+    }
+
+    /// Restarts the engine in one click: stop, then start when the stop
+    /// worker finishes (see [`Self::poll_stop`]).
+    fn restart_engine(&mut self) {
+        if self.engine.is_some() && self.stopping.is_none() {
+            self.restart_after_stop = true;
+            self.stop_engine();
         }
     }
 
@@ -631,6 +757,7 @@ impl App {
                     process,
                     in_redirect_list,
                 } => {
+                    self.queries_total += 1;
                     let route_ident = if in_redirect_list { "🛡️" } else { "➡️" };
                     let line = match process {
                         Some(process) => format!("{route_ident} query -> {domain} ({process})"),
@@ -638,14 +765,27 @@ impl App {
                     };
                     self.push_query(line);
                 }
-                Event::Started { listen, gateway } => self.push_log(format!(
-                    "started: listening on {listen}, routing via {gateway}"
-                )),
+                Event::Started { listen, gateway } => {
+                    self.engine_started_at = Some(Instant::now());
+                    self.next_hop = Some(gateway);
+                    self.push_log(format!(
+                        "started: listening on {listen}, routing via {gateway}"
+                    ));
+                }
                 Event::Stopped => {
+                    self.engine_started_at = None;
+                    self.next_hop = None;
+                    self.routes_total = 0;
                     self.push_log("stopped: routes cleaned up".to_owned());
                 }
-                Event::RouteAdded { ip } => self.push_log(format!("route + {ip}")),
-                Event::RouteRemoved { ip } => self.push_log(format!("route - {ip}")),
+                Event::RouteAdded { ip } => {
+                    self.routes_total = self.routes_total.saturating_add(1);
+                    self.push_log(format!("route + {ip}"));
+                }
+                Event::RouteRemoved { ip } => {
+                    self.routes_total = self.routes_total.saturating_sub(1);
+                    self.push_log(format!("route - {ip}"));
+                }
                 Event::Error(message) => self.push_log(format!("error: {message}")),
                 Event::Warning(message) => self.push_log(format!("warning: {message}")),
                 Event::Info(message) => self.push_log(message),
@@ -654,9 +794,13 @@ impl App {
     }
 
     /// Appends a line to the bounded system log (start/stop, routes,
-    /// warnings, errors, info).
+    /// warnings, errors, info). Prefixes each line with a wall-clock time.
     fn push_log(&mut self, line: String) {
-        Self::push_bounded(&mut self.system_log, line);
+        let (h, m, s) = utc_hms();
+        Self::push_bounded(
+            &mut self.system_log,
+            format!("[{h:02}:{m:02}:{s:02}] {line}"),
+        );
     }
 
     /// Appends a line to the bounded DNS-query log.
@@ -673,106 +817,123 @@ impl App {
     }
 
     fn settings_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Settings");
-        ui.separator();
-
-        egui::Grid::new("settings_grid")
-            .num_columns(2)
-            .spacing([12.0, 8.0])
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.label("Listen address");
-                ui.text_edit_singleline(&mut self.draft.listen_addr);
-                ui.end_row();
+                ui.heading("Settings");
+                ui.separator();
 
-                ui.label("DNS server");
-                ui.text_edit_singleline(&mut self.draft.dns_server);
-                ui.end_row();
+                egui::Grid::new("settings_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Listen address");
+                        ui.text_edit_singleline(&mut self.draft.listen_addr);
+                        ui.end_row();
 
-                ui.label("VPN gateway (IPv4)");
-                ui.text_edit_singleline(&mut self.draft.vpn_gateway);
-                ui.end_row();
+                        ui.label("DNS server");
+                        ui.text_edit_singleline(&mut self.draft.dns_server);
+                        ui.end_row();
 
-                ui.label("VPN interface");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.draft.vpn_interface)
-                        .hint_text("empty = auto-detect; or ifIndex/alias"),
-                );
-                ui.end_row();
+                        ui.label("VPN gateway (IPv4)");
+                        ui.text_edit_singleline(&mut self.draft.vpn_gateway);
+                        ui.end_row();
 
-                ui.label("Timeout (ms)");
-                ui.add(egui::DragValue::new(&mut self.draft.timeout_ms).range(1..=u64::MAX));
-                ui.end_row();
-            });
+                        ui.label("VPN interface");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.draft.vpn_interface)
+                                .hint_text("empty = auto-detect; or ifIndex/alias"),
+                        );
+                        ui.end_row();
 
-        ui.add_space(8.0);
-        ui.label("Redirect list (routed through the VPN, subdomains included)");
-        let mut remove = None;
-        for (index, domain) in self.draft.redirect_list.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
-                ui.text_edit_singleline(domain);
-                if ui.small_button("Remove").clicked() {
-                    remove = Some(index);
-                }
-            });
-        }
-        if let Some(index) = remove {
-            self.draft.redirect_list.remove(index);
-        }
-        if ui.button("Add domain").clicked() {
-            self.draft.redirect_list.push(String::new());
-        }
+                        ui.label("Timeout (ms)");
+                        ui.add(
+                            egui::DragValue::new(&mut self.draft.timeout_ms)
+                                .range(1..=u64::MAX),
+                        );
+                        ui.end_row();
+                    });
 
-        ui.add_space(8.0);
-        ui.label("Static routes (CIDR — always routed while the engine runs)");
-        let mut remove_cidr = None;
-        for (index, cidr) in self.draft.cidr_list.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
-                ui.text_edit_singleline(cidr);
-                if ui.small_button("Remove").clicked() {
-                    remove_cidr = Some(index);
-                }
-            });
-        }
-        if let Some(index) = remove_cidr {
-            self.draft.cidr_list.remove(index);
-        }
-        if ui.button("Add CIDR").clicked() {
-            self.draft.cidr_list.push(String::new());
-        }
-
-        let errors = self.draft.errors();
-        for error in &errors {
-            ui.colored_label(egui::Color32::RED, error);
-        }
-
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            let save_clicked = ui
-                .add_enabled(
-                    errors.is_empty() && self.draft != self.settings,
-                    egui::Button::new("Save"),
+                ui.add_space(8.0);
+                egui::CollapsingHeader::new(
+                    "Redirect list (routed through the VPN, subdomains included)",
                 )
-                .clicked();
-            if save_clicked {
-                self.settings = self.draft.normalized();
-                self.draft = self.settings.clone();
-                if let Some(engine) = &self.engine {
-                    // The redirect list and static networks apply without an
-                    // engine restart.
-                    engine.set_redirect_list(self.settings.redirect_list.clone());
-                    engine.set_cidr_list(self.settings.cidr_list.clone());
+                .default_open(true)
+                .show(ui, |ui| {
+                    let mut remove = None;
+                    for (index, domain) in self.draft.redirect_list.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.text_edit_singleline(domain);
+                            if ui.small_button("Remove").clicked() {
+                                remove = Some(index);
+                            }
+                        });
+                    }
+                    if let Some(index) = remove {
+                        self.draft.redirect_list.remove(index);
+                    }
+                    if ui.button("Add domain").clicked() {
+                        self.draft.redirect_list.push(String::new());
+                    }
+                });
+
+                ui.add_space(8.0);
+                egui::CollapsingHeader::new(
+                    "Static routes (CIDR — always routed while the engine runs)",
+                )
+                .default_open(true)
+                .show(ui, |ui| {
+                    let mut remove_cidr = None;
+                    for (index, cidr) in self.draft.cidr_list.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.text_edit_singleline(cidr);
+                            if ui.small_button("Remove").clicked() {
+                                remove_cidr = Some(index);
+                            }
+                        });
+                    }
+                    if let Some(index) = remove_cidr {
+                        self.draft.cidr_list.remove(index);
+                    }
+                    if ui.button("Add CIDR").clicked() {
+                        self.draft.cidr_list.push(String::new());
+                    }
+                });
+
+                let errors = self.draft.errors();
+                for error in &errors {
+                    ui.colored_label(egui::Color32::RED, error);
                 }
-            }
-            if ui
-                .add_enabled(self.draft != self.settings, egui::Button::new("Revert"))
-                .clicked()
-            {
-                self.draft = self.settings.clone();
-            }
-            if ui.button("Restore defaults").clicked() {
-                self.draft = Settings::default();
-            }
-        });
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let save_clicked = ui
+                        .add_enabled(
+                            errors.is_empty() && self.draft != self.settings,
+                            egui::Button::new("Save"),
+                        )
+                        .clicked();
+                    if save_clicked {
+                        self.settings = self.draft.normalized();
+                        self.draft = self.settings.clone();
+                        if let Some(engine) = &self.engine {
+                            // The redirect list and static networks apply
+                            // without an engine restart.
+                            engine.set_redirect_list(self.settings.redirect_list.clone());
+                            engine.set_cidr_list(self.settings.cidr_list.clone());
+                        }
+                    }
+                    if ui
+                        .add_enabled(self.draft != self.settings, egui::Button::new("Revert"))
+                        .clicked()
+                    {
+                        self.draft = self.settings.clone();
+                    }
+                    if ui.button("Restore defaults").clicked() {
+                        self.draft = Settings::default();
+                    }
+                });
+            });
     }
 }
 

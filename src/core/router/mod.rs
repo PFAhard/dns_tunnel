@@ -52,6 +52,20 @@ pub fn registry_path() -> Option<PathBuf> {
         .map(|base| PathBuf::from(base).join("dns_tunnel").join("routes.ron"))
 }
 
+/// Whether `ip` is a valid route destination — a routable unicast address.
+///
+/// Rejects the reserved ranges that make no sense as a tunnel host route:
+/// `0.0.0.0/8` (source-only; resolvers return `0.0.0.0` for blocked
+/// domains), `127.0.0.0/8` (loopback), `224.0.0.0/4` (multicast), and
+/// `240.0.0.0/4` (reserved, including the broadcast address). Private,
+/// link-local, and shared-address ranges are accepted — the VPN can
+/// legitimately route them.
+#[must_use]
+pub fn is_routable(ip: Ipv4Addr) -> bool {
+    let first = ip.octets()[0];
+    first != 0 && first != 127 && first < 224
+}
+
 /// On-disk shape of the registry.
 ///
 /// The field is named `gateway` for compatibility with existing registry
@@ -177,12 +191,20 @@ impl RouteRegistry {
     /// If the IP is already routed, only its timestamp is refreshed.
     /// Returns `Ok(true)` when a new OS route was added.
     ///
+    /// Non-routable addresses ([`is_routable`]) are silently skipped and
+    /// reported as `Ok(false)` — resolvers return `0.0.0.0` for blocked
+    /// domains, and a route for it (or for loopback / multicast /
+    /// reserved) is meaningless and would only add noise to the log.
+    ///
     /// # Errors
     ///
     /// Returns an error if the OS refuses the route (e.g. unreachable
     /// next hop). Persistence is best-effort — a failed save is ignored;
     /// reboot-clearance and manual cleanup remain as safety nets.
     pub fn register(&mut self, ip: Ipv4Addr, now: Instant) -> io::Result<bool> {
+        if !is_routable(ip) {
+            return Ok(false);
+        }
         if let Some(added) = self.entries.get_mut(&ip) {
             *added = now;
             return Ok(false);
@@ -352,6 +374,52 @@ mod tests {
             std::process::id(),
             name
         ))
+    }
+
+    #[test]
+    fn register_skips_non_routable_ips() {
+        let ops = FakeOps::new();
+        let mut registry = RouteRegistry::new(gateway(), Box::new(ops.clone()));
+        let now = Instant::now();
+        for ip in [
+            Ipv4Addr::new(0, 0, 0, 0),
+            Ipv4Addr::new(0, 0, 0, 1),
+            Ipv4Addr::new(0, 255, 255, 255),
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(127, 255, 255, 255),
+            Ipv4Addr::new(224, 0, 0, 1),
+            Ipv4Addr::new(239, 255, 255, 255),
+            Ipv4Addr::new(240, 0, 0, 1),
+            Ipv4Addr::new(255, 255, 255, 255),
+        ] {
+            assert!(
+                !registry.register(ip, now).unwrap(),
+                "{ip} should not be routed"
+            );
+        }
+        assert!(ops.added().is_empty());
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn register_accepts_private_and_public_ips() {
+        let ops = FakeOps::new();
+        let mut registry = RouteRegistry::new(gateway(), Box::new(ops.clone()));
+        let now = Instant::now();
+        for ip in [
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(172, 16, 0, 1),
+            Ipv4Addr::new(169, 254, 1, 1),
+            Ipv4Addr::new(100, 64, 0, 1),
+            Ipv4Addr::new(8, 8, 8, 8),
+            Ipv4Addr::new(1, 1, 1, 1),
+        ] {
+            assert!(
+                registry.register(ip, now).unwrap(),
+                "{ip} should be routed"
+            );
+        }
     }
 
     #[test]
