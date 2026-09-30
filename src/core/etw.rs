@@ -40,10 +40,24 @@ const ATTRIBUTION_WINDOW: Duration = Duration::from_secs(5);
 /// How long an attribution stays answerable after it was made.
 const ATTRIBUTION_HOLDOFF: Duration = Duration::from_secs(6);
 
+/// How often the UDP port table is refreshed. Browsers open resolver
+/// sockets rarely (typically once per session), so a few seconds of
+/// staleness is harmless — and `netstat -ano` is not free.
+const PORT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Upper bound for the pending queue — browsers flood queries far faster
 /// than the window; entries evicted before their event lands lose their
 /// attribution. Memory is trivial (a few strings × 2k).
 const PENDING_CAPACITY: usize = 2048;
+
+/// Upper bound for the domain → attribution cache. Beyond this, expired
+/// entries are dropped on the next query so a long-lived session stays
+/// bounded.
+const ATTRS_CAPACITY: usize = 4096;
+
+/// Upper bound for the PID → process-name cache. When exceeded the cache
+/// is cleared — names are cheap to re-resolve via `tasklist`.
+const NAMES_CAPACITY: usize = 4096;
 
 /// State shared between the ETW callback thread and the listener.
 #[derive(Default)]
@@ -63,6 +77,15 @@ impl State {
         self.pending.push_back((domain, now));
         if self.pending.len() > PENDING_CAPACITY {
             self.pending.pop_front();
+        }
+        // Opportunistic bounds — `attrs` and `names` would otherwise grow
+        // for the process's whole lifetime on a busy machine.
+        if self.attrs.len() > ATTRS_CAPACITY {
+            self.attrs
+                .retain(|_, (_, at)| now.duration_since(*at) <= ATTRIBUTION_HOLDOFF);
+        }
+        if self.names.len() > NAMES_CAPACITY {
+            self.names.clear();
         }
     }
 
@@ -110,19 +133,34 @@ impl ProcessTracker {
     /// Returns an error if the trace session cannot be started.
     pub fn start() -> Result<Self, String> {
         let state = Arc::new(Mutex::new(State::default()));
-        let callback_state = Arc::clone(&state);
-        let provider = Provider::by_guid(DNS_CLIENT_PROVIDER)
-            .add_callback(move |record, locator| on_event(record, locator, &callback_state))
-            .trace_flags(TraceFlags::EVENT_ENABLE_PROPERTY_PROCESS_START_KEY)
-            .build();
-        let trace = UserTrace::new()
-            .enable(provider)
-            .start_and_process()
-            .map_err(|error| format!("failed to start ETW trace: {error:?}"))?;
-        Ok(Self {
-            state,
-            _trace: trace,
-        })
+        // `StartTraceW` can return `ERROR_NO_SYSTEM_RESOURCES` (0x800705AA)
+        // transiently when the kernel briefly can't allocate the session's
+        // event buffers. Retrying after a short pause often succeeds where
+        // an immediate retry wouldn't, without masking a genuine cap-out
+        // (which fails all attempts equally).
+        let mut last_error = String::new();
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            let callback_state = Arc::clone(&state);
+            let provider = Provider::by_guid(DNS_CLIENT_PROVIDER)
+                .add_callback(move |record, locator| on_event(record, locator, &callback_state))
+                .trace_flags(TraceFlags::EVENT_ENABLE_PROPERTY_PROCESS_START_KEY)
+                .build();
+            match UserTrace::new().enable(provider).start_and_process() {
+                Ok(trace) => {
+                    return Ok(Self {
+                        state,
+                        _trace: trace,
+                    });
+                }
+                Err(error) => {
+                    last_error = format!("failed to start ETW trace: {error:?}");
+                }
+            }
+        }
+        Err(last_error)
     }
 
     /// Notes a forwarded query, to be attributed when its ETW event lands.
@@ -153,14 +191,25 @@ fn on_event(record: &EventRecord, locator: &SchemaLocator, state: &Mutex<State>)
         return;
     }
     let pid = record.process_id();
-    let name = {
-        let mut s = lock_ok(state);
-        if let Some(cached) = s.names.get(&pid) {
-            cached.clone()
-        } else {
+    // Resolve the name outside the lock: `process_name` spawns `tasklist`
+    // (tens of ms), and holding the mutex across it would stall the
+    // listener thread and `PortOwners::name_of`.
+    //
+    // Bind the lookup to a local first. A `MutexGuard` in the scrutinee
+    // of a `match` lives until the end of the match, so `lock_ok(state)`
+    // would still be held when the `None` arm runs `process_name` and then
+    // tries to lock again — self-deadlock on the non-reentrant mutex.
+    // (Same trap as the forwarder's recv_from match.)
+    let cached = lock_ok(state).names.get(&pid).cloned();
+    let name = match cached {
+        Some(cached) => cached,
+        None => {
             let resolved = process_name(pid);
-            s.names.insert(pid, resolved.clone());
-            resolved
+            lock_ok(state)
+                .names
+                .entry(pid)
+                .or_insert(resolved)
+                .clone()
         }
     };
     // dnscache emits its own events for every relayed query; joining on
@@ -198,7 +247,11 @@ impl PortOwners {
                     if let Some(snapshot) = snapshot_ports() {
                         *write_ok(&thread_map) = snapshot;
                     }
-                    std::thread::sleep(Duration::from_secs(1));
+                    // `netstat -ano` is not free; browsers open resolver
+                    // sockets rarely, so a few seconds of staleness is
+                    // harmless. `park_timeout` keeps shutdown responsive
+                    // (see `Drop`, which unpark()s the thread).
+                    std::thread::park_timeout(PORT_SNAPSHOT_INTERVAL);
                 }
             })
             .ok();
@@ -219,11 +272,17 @@ impl PortOwners {
     /// Resolves a PID to its process name, cached.
     #[must_use]
     pub fn name_of(&self, pid: u32) -> String {
-        let mut names = lock_ok(&self.names);
-        names
-            .entry(pid)
-            .or_insert_with(|| process_name(pid))
-            .clone()
+        let cached = lock_ok(&self.names).get(&pid).cloned();
+        match cached {
+            Some(name) => name,
+            None => {
+                let resolved = process_name(pid);
+                lock_ok(&self.names)
+                    .entry(pid)
+                    .or_insert(resolved)
+                    .clone()
+            }
+        }
     }
 }
 
@@ -231,6 +290,9 @@ impl Drop for PortOwners {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
+            // Wake the worker out of `park_timeout` so shutdown is not
+            // delayed by up to PORT_SNAPSHOT_INTERVAL.
+            thread.thread().unpark();
             let _ = thread.join();
         }
     }

@@ -23,9 +23,9 @@ use crate::core::router::RouteRegistry;
 /// to a new thread.
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn run(
+    listener: Arc<UdpSocket>,
     upstream: Arc<RwLock<UdpSocket>>,
     upstream_addr: SocketAddr,
-    responder: Arc<UdpSocket>,
     pending: PendingMap,
     registry: Arc<Mutex<RouteRegistry>>,
     events: mpsc::Sender<Event>,
@@ -45,7 +45,7 @@ pub(crate) fn run(
                 // Drop pending queries whose deadline passed — the client
                 // will time out on its own.
                 lock_ok(&pending).retain(|_, entry| entry.deadline > Instant::now());
-                handle_response(&mut buf, len, &responder, &pending, &registry, &events);
+                handle_response(&mut buf, len, &listener, &pending, &registry, &events);
             }
             Ok((len, source)) => {
                 let _ = events.send(Event::Warning(format!(
@@ -99,7 +99,7 @@ fn recreate_upstream(upstream: &RwLock<UdpSocket>) -> std::io::Result<()> {
 fn handle_response(
     buf: &mut [u8],
     len: usize,
-    responder: &UdpSocket,
+    listener: &UdpSocket,
     pending: &PendingMap,
     registry: &Mutex<RouteRegistry>,
     events: &mpsc::Sender<Event>,
@@ -141,12 +141,12 @@ fn handle_response(
         }
     }
 
-    // Answers go out from the dedicated responder socket: not the :53
-    // listener (loopback replies sourced from 53 are filtered by Windows)
-    // and not the upstream socket (a late answer to a closed client port
-    // would ICMP-poison it — see the engine's socket setup).
+    // Answers go out from the listener socket — bound to the address the
+    // client sent its query to. Sending from an ephemeral socket (the
+    // previous design) breaks UDP clients, which match replies by source
+    // IP:port and silently drop a reply from the wrong port.
     if let Some(client) = entry.client
-        && let Err(e) = responder.send_to(&out, client)
+        && let Err(e) = listener.send_to(&out, client)
     {
         let _ = events.send(Event::Error(format!(
             "failed to return response to {client}: {e}"

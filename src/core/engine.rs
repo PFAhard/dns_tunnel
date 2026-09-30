@@ -218,20 +218,19 @@ impl Engine {
         // send_to/recv_from with a source check is the robust pattern.
         let upstream_socket = UdpSocket::bind("0.0.0.0:0")?;
         upstream_socket.set_read_timeout(Some(POLL_INTERVAL))?;
-        // Client answers go out from this dedicated socket, NEVER the
-        // upstream one: a late answer to a client port that already closed
-        // (dnscache retries) makes the local stack send a loopback ICMP
-        // port-unreachable, which Windows delivers as WSAECONNRESET to the
-        // sending socket. Containing that blast on an unread socket keeps
-        // the upstream receiver clean.
-        let responder = UdpSocket::bind("0.0.0.0:0")?;
+        // Client answers go out from the LISTENER socket (the one bound to
+        // the configured listen address), never the upstream socket. UDP
+        // clients — including the Windows resolver and `nslookup` — match
+        // replies by source IP:port; a reply sent from an ephemeral
+        // socket is silently dropped by the client and looks like a
+        // timeout. The upstream socket stays dedicated to talking to the
+        // real resolver.
 
         let (command_tx, command_rx) = mpsc::channel();
         let runtime = Runtime {
             listener: Arc::new(listener),
             upstream: Arc::new(RwLock::new(upstream_socket)),
             upstream_addr,
-            responder: Arc::new(responder),
             pending: server::PendingMap::default(),
             redirect: Arc::new(RwLock::new(RedirectList::new(
                 settings.redirect_list.clone(),
@@ -270,7 +269,6 @@ struct Runtime {
     listener: Arc<UdpSocket>,
     upstream: Arc<RwLock<UdpSocket>>,
     upstream_addr: SocketAddr,
-    responder: Arc<UdpSocket>,
     pending: server::PendingMap,
     redirect: Arc<RwLock<RedirectList>>,
     id_counter: Arc<AtomicU16>,
@@ -322,18 +320,18 @@ fn spawn_threads(
         thread::Builder::new()
             .name("dns-upstream".to_owned())
             .spawn({
+                let listener = Arc::clone(&runtime.listener);
                 let upstream = Arc::clone(&runtime.upstream);
                 let upstream_addr = runtime.upstream_addr;
-                let responder = Arc::clone(&runtime.responder);
                 let pending = Arc::clone(&runtime.pending);
                 let registry = Arc::clone(&runtime.registry);
                 let events = runtime.events.clone();
                 let shutdown = Arc::clone(&runtime.shutdown);
                 move || {
                     forwarder::run(
+                        listener,
                         upstream,
                         upstream_addr,
-                        responder,
                         pending,
                         registry,
                         events,

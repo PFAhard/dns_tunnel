@@ -25,10 +25,23 @@ pub(crate) fn hidden(mut command: Command) -> Command {
 pub struct WindowsRouter;
 
 impl WindowsRouter {
-    /// Whether the current process runs elevated (checked via `net session`,
-    /// which only succeeds for administrators).
+    /// Whether the current process runs elevated.
+    ///
+    /// `fltmc` (Filter Manager control) requires an elevated token on every
+    /// Vista+ system and returns a zero exit code when run as admin — that
+    /// is the primary signal. `net session` is kept only as a fallback for
+    /// the rare machine where `fltmc.exe` is missing: it depends on the
+    /// Server (LanmanServer) service, which is commonly disabled on tweaked
+    /// systems and would then report a false negative for an elevated
+    /// process, so it is not trusted as the primary check.
     #[must_use]
     pub fn is_elevated() -> bool {
+        if hidden(Command::new("fltmc"))
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return true;
+        }
         hidden(Command::new("net"))
             .args(["session"])
             .output()

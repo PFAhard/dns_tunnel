@@ -150,6 +150,9 @@ pub fn parse_name(bytes: &[u8], pos: &mut usize) -> Result<String, Error> {
 pub fn parse_questions(bytes: &[u8]) -> Result<(Header, Vec<Question>, usize), Error> {
     let header = parse_header(bytes)?;
     let mut pos = 12usize;
+    // Minimum question is a root name (1 byte) + qtype (2) + qclass (2) = 5
+    // bytes; cap the pre-allocation so a tiny malicious packet claiming a
+    // huge qdcount cannot make us reserve megabytes up front.
     let mut questions = Vec::with_capacity(usize::from(header.qdcount));
     for _ in 0..header.qdcount {
         let name = parse_name(bytes, &mut pos)?;

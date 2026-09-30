@@ -104,11 +104,7 @@ pub(crate) fn run(listener: Arc<UdpSocket>, ctx: ListenerCtx) {
                         (pid != 0 && pid != 4).then(|| ctx.ports.name_of(pid))
                     });
 
-                let in_redirect_list = ctx
-                    .redirect
-                    .read()
-                    .expect("RwLock failed, when trying to log query")
-                    .matches(&domain);
+                let in_redirect_list = read_ok(&ctx.redirect).matches(&domain);
 
                 let _ = ctx.events.send(Event::QueryForwarded { domain, process, in_redirect_list });
             }
@@ -160,6 +156,12 @@ pub(crate) fn run(listener: Arc<UdpSocket>, ctx: ListenerCtx) {
                 handle_query(&mut buf, len, client, &ctx, &mut last_send, &mut deferred);
             }
             Err(e) if is_timeout(&e) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                // A previous reply to a since-closed client port made the
+                // local stack send an ICMP port-unreachable, which Windows
+                // surfaces as WSAECONNRESET on the next recv. Harmless —
+                // just keep receiving.
+            }
             Err(e) => {
                 // Transient receive errors must not kill the engine.
                 let _ = ctx
@@ -244,13 +246,19 @@ fn throttle(last_send: &mut Instant) {
 }
 
 /// Returns an ID that is not currently used in the pending table.
+///
+/// Bounded to one full sweep of the u16 space. Every slot being taken
+/// means the forwarder is stuck; overwriting a stale entry is preferable
+/// to hanging the listener thread forever.
 fn next_free_id(counter: &AtomicU16, pending: &PendingMap) -> u16 {
-    loop {
-        let id = counter.fetch_add(1, Ordering::Relaxed);
+    let mut id = 0u16;
+    for _ in 0..=u16::MAX {
+        id = counter.fetch_add(1, Ordering::Relaxed);
         if !lock_ok(pending).contains_key(&id) {
             return id;
         }
     }
+    id
 }
 
 /// Pre-resolves `domains` upstream so their IPs get routed immediately —

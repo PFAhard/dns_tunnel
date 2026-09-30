@@ -35,9 +35,9 @@ pub fn is_valid_domain(domain: &str) -> bool {
 /// listings (`example.com` next to `www.example.com`, before `a.org`).
 #[must_use]
 pub fn compare_tld_first(a: &str, b: &str) -> std::cmp::Ordering {
-    let a: Vec<&str> = a.split('.').rev().collect();
-    let b: Vec<&str> = b.split('.').rev().collect();
-    a.cmp(&b)
+    // `Iterator::cmp` compares lexicographically without materializing
+    // the reversed label lists — cheaper on large lists.
+    a.split('.').rev().cmp(b.split('.').rev())
 }
 
 /// Extracts the registrable part of `domain` using the public suffix list
